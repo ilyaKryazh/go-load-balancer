@@ -2,13 +2,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Backend struct {
@@ -25,12 +28,14 @@ type ServerPool struct {
 
 var serverPool ServerPool
 
-func main() {
-	u, _ := url.Parse("http://localhost:8080")
-	rp := httputil.NewSingleHostReverseProxy(u)
-	http.HandleFunc("/", rp.ServeHTTP)
-	http.ListenAndServe(":3000", nil)
+type ctxKey int
 
+const (
+	Attempts ctxKey = iota
+	Retry
+)
+
+func main() {
 	targets := []string{
 		"http://localhost:8081",
 		"http://localhost:8082",
@@ -48,22 +53,11 @@ func main() {
 		Addr: fmt.Sprintf(":%d", port),
 	}
 
+	go healthCheck()
+
 	fmt.Printf("Load balancer started at %s\n", server.Addr)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
-	}
-}
-
-func initializeServerPool(targets []string) {
-	for _, t := range targets {
-		u, _ := url.Parse(t)
-		proxy := httputil.NewSingleHostReverseProxy(u)
-		backend := &Backend{
-			URL:          u,
-			Alive:        true,
-			ReverseProxy: proxy,
-		}
-		serverPool.AddBackend(backend)
 	}
 }
 
@@ -80,8 +74,61 @@ func (s *ServerPool) AddBackend(backend *Backend) {
 	s.backends = append(s.backends, backend)
 }
 
+func initializeServerPool(targets []string) {
+	for _, t := range targets {
+		u, _ := url.Parse(t)
+		proxy := httputil.NewSingleHostReverseProxy(u)
+		backend := &Backend{
+			URL:          u,
+			ReverseProxy: proxy,
+		}
+		b := backend
+		p := proxy
+		proxy.ErrorHandler = func(writter http.ResponseWriter, req *http.Request, e error) {
+			log.Printf("[%s] %s\n", b.URL, e.Error())
+			retries := GetRetryFromContext(req)
+			attempts := GetAttemptsFromContext(req)
+			if retries < 3 {
+				time.Sleep(10 * time.Millisecond)
+				ctx := context.WithValue(req.Context(), Retry, retries+1)
+				p.ServeHTTP(writter, req.WithContext(ctx))
+				return
+			}
+
+			serverPool.MarkServiceDown(backend.URL)
+			// if the same rN(next
+			ctx := context.WithValue(req.Context(), Attempts, attempts+1)
+			lb(writter, req.WithContext(ctx))
+		}
+		backend.setAlive(true)
+		serverPool.AddBackend(backend)
+	}
+}
+
+func GetRetryFromContext(req *http.Request) int {
+	if retries, ok := req.Context().Value(Retry).(int); ok {
+		return retries
+	}
+	return 0
+}
+
+func GetAttemptsFromContext(req *http.Request) int {
+	if attemps, ok := req.Context().Value(Attempts).(int); ok {
+		return attemps
+	}
+	return 0
+}
+
+func (s *ServerPool) MarkServiceDown(u *url.URL) {
+	for i := range s.backends {
+		if s.backends[i].URL.String() == u.String() {
+			s.backends[i].setAlive(false)
+		}
+	}
+}
+
 func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)%uint64(len(s.backends))))
+	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
 func (s *ServerPool) GetNextPeer() *Backend {
@@ -100,6 +147,18 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
+func (s *ServerPool) HealthCheck() {
+	for _, b := range s.backends {
+		status := "up"
+		alive := isBackendAlive(b.URL)
+		b.setAlive(alive)
+		if !alive {
+			status = "down"
+		}
+		log.Printf("%s [%s]\n", b.URL, status)
+	}
+}
+
 func (b *Backend) setAlive(alive bool) {
 	b.mux.Lock()
 	b.Alive = alive
@@ -109,6 +168,26 @@ func (b *Backend) setAlive(alive bool) {
 func (b *Backend) isAlive() (alive bool) {
 	b.mux.Lock()
 	alive = b.Alive
-	b.mux.RUnlock()
+	b.mux.Unlock()
 	return alive
+}
+
+func isBackendAlive(url *url.URL) bool {
+	timeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", url.Host, timeout)
+	if err != nil {
+		log.Println("Server unreachable, error: ", err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func healthCheck() {
+	t := time.NewTicker(time.Second * 20)
+	for range t.C {
+		log.Println("Start healthcheck")
+		serverPool.HealthCheck()
+		log.Println("Healthcheck completed")
+	}
 }
