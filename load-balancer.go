@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Backend struct {
@@ -30,27 +28,6 @@ var serverPool ServerPool
 func main() {
 	u, _ := url.Parse("http://localhost:8080")
 	rp := httputil.NewSingleHostReverseProxy(u)
-	rp.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
-		log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
-		retries := GetRetryFromContext(request)
-		if retries < 3 {
-			select {
-			case <-time.After(10 * time.Millisecond):
-				ctx := context.WithValue(request.Context(), Retry, retries+1)
-				proxy.ServeHTTP(writer, request.WithContext(ctx))
-			}
-			return
-		}
-
-		// after 3 retries, mark this backend as down
-		serverPool.MarkBackendStatus(serverUrl, false)
-
-		// if the same request routing for few attempts with different backends, increase the count
-		attempts := GetAttemptsFromContext(request)
-		log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
-		ctx := context.WithValue(request.Context(), Attempts, attempts+1)
-		lb(writer, request.WithContext(ctx))
-	}
 	http.HandleFunc("/", rp.ServeHTTP)
 	http.ListenAndServe(":3000", nil)
 
@@ -134,17 +111,4 @@ func (b *Backend) isAlive() (alive bool) {
 	alive = b.Alive
 	b.mux.RUnlock()
 	return alive
-}
-
-const (
-	Attempts int = iota
-	Retry
-)
-
-// GetAttemptsFromContext returns the attempts for request
-func GetRetryFromContext(r *http.Request) int {
-	if retry, ok := r.Context().Value(Retry).(int); ok {
-		return retry
-	}
-	return 0
 }
